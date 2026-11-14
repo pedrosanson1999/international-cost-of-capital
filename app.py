@@ -484,6 +484,44 @@ def fetch_bond_yields() -> FetchResult:
     return _with_fallback("10-year government bond yields", TE_BONDS_URL, live, snap)
 
 
+TE_COUNTRY_URL = "https://tradingeconomics.com/{slug}/government-bond-yield"
+
+
+def te_slug(country: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", country.lower()).strip("-")
+
+
+def parse_te_country_html(html: str) -> tuple[float, str]:
+    """Yield (decimal) and quote date from a single-country page, e.g. /thailand/government-bond-yield.
+
+    Uses the chart metadata ("last": 1.995) for full precision, else the quote cell (td#p);
+    the date comes from the page description ("... rose to 2.00% on November 13, 2026 ...").
+    """
+    y = None
+    m = re.search(r"TEChartsMeta\s*=\s*\[\s*\{.*?\"last\"\s*:\s*(-?[\d.]+)", html, re.S)
+    if m:
+        y = float(m.group(1))
+    else:
+        soup = BeautifulSoup(html, "html.parser")
+        p = soup.find("td", id="p")
+        y = _num(p.get_text(strip=True)) if p else None
+    if y is None:
+        raise ValueError("Yield not found on Trading Economics country page")
+    d = re.search(r"\bon ([A-Z][a-z]+ \d{1,2}, \d{4})", html)
+    as_of = datetime.strptime(d.group(1), "%B %d, %Y").date().isoformat() if d else "date not shown"
+    return y / 100, as_of
+
+
+def fetch_country_yield(country: str) -> FetchResult:
+    """Live 10Y yield for one country from its own page (used when the /bonds table is blocked)."""
+    url = TE_COUNTRY_URL.format(slug=te_slug(country))
+    try:
+        y, as_of = parse_te_country_html(_get(url).text)
+        return FetchResult(f"{country} 10Y yield", {"yield": y, "date": as_of}, url, as_of, "live")
+    except Exception as exc:  # noqa: BLE001
+        return FetchResult(f"{country} 10Y yield", None, url, "", "failed", error=f"{type(exc).__name__}: {exc}"[:300])
+
+
 def fetch_all() -> dict[str, FetchResult]:
     return {
         "betas": fetch_betas(),
@@ -847,6 +885,11 @@ def load_data():
     return fetch_all()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_country_yield(country: str):
+    return fetch_country_yield(country)
+
+
 def pct(x, nd=4):
     return "n/a" if x is None or pd.isna(x) else f"{x * 100:.{nd}f}%"
 
@@ -879,6 +922,7 @@ with st.sidebar:
     st.header("Data")
     if st.button("🔄 Refresh data fetch", width="stretch"):
         load_data.clear()
+        load_country_yield.clear()
         for k in [k for k in st.session_state if k.startswith("show_")]:
             del st.session_state[k]
         st.rerun()
@@ -893,6 +937,16 @@ with st.sidebar:
                            index=country_list.index(DEFAULT_COUNTRY) if DEFAULT_COUNTRY in country_list else 0)
     erp = st.slider("Equity risk premium (%)", 0.0, 15.0, 6.5, 0.1) / 100
     debt_share = st.slider("Target debt share D/(D+E) (%)", 0.0, 90.0, 30.0, 1.0) / 100
+
+    # The /bonds table is behind a bot check for servers; fall back to each country's own page.
+    yield_src = {c: (data["yields"].status, data["yields"].source_url) for c in ("United States", country)}
+    if data["yields"].status != "live":
+        for c in ("United States", country):
+            cy = load_country_yield(c)
+            if cy.status == "live":
+                countries.loc[countries["country"] == c, ["yield_10y", "yield_date"]] = [cy.data["yield"], cy.data["date"]]
+                yield_src[c] = ("live (country page)", cy.source_url)
+    yields_live = all(v[0].startswith("live") for v in yield_src.values())
 
     crow = countries.set_index("country").loc[country]
     us_row = countries.set_index("country").loc["United States"]
@@ -987,10 +1041,10 @@ sources = pd.DataFrame(
         {"Data": f"{country} corporate tax rate (combined statutory)", "Value": pct(tax_fx, 2),
          "Source": data["tax"].source_url, "As of": f"{crow['tax_year']:.0f}" if not pd.isna(crow["tax_year"]) else "not in OECD data",
          "Status": "manual" if ovr_tax_fx else data["tax"].status},
-        {"Data": "U.S. 10Y government yield", "Value": pct(rf_us, 3), "Source": data["yields"].source_url,
-         "As of": us_row["yield_date"], "Status": "manual" if ovr_rf_us else data["yields"].status},
-        {"Data": f"{country} 10Y government yield", "Value": pct(rf_fx, 3), "Source": data["yields"].source_url,
-         "As of": crow["yield_date"], "Status": "manual" if ovr_rf_fx else data["yields"].status},
+        {"Data": "U.S. 10Y government yield", "Value": pct(rf_us, 3), "Source": yield_src["United States"][1],
+         "As of": us_row["yield_date"], "Status": "manual" if ovr_rf_us else yield_src["United States"][0]},
+        {"Data": f"{country} 10Y government yield", "Value": pct(rf_fx, 3), "Source": yield_src[country][1],
+         "As of": crow["yield_date"], "Status": "manual" if ovr_rf_fx else yield_src[country][0]},
     ]
 )
 
@@ -1001,7 +1055,7 @@ st.title("🌍 International Cost of Capital")
 st.caption(f"**{industry}** project in **{country}** · project tax rate: **{tax_label}** ({pct(tax_rate, 2)}) · "
            f"ERP {pct(erp, 1)} · debt share {pct(debt_share, 0)}")
 
-fallbacks = [r for r in data.values() if r.status == "snapshot"]
+fallbacks = [r for k, r in data.items() if r.status == "snapshot" and not (k == "yields" and yields_live)]
 if fallbacks:
     st.warning("Live fetch failed for: " + ", ".join(r.name for r in fallbacks)
                + ". Using the bundled snapshot instead - press **Refresh data fetch** to retry, or override manually.")
@@ -1075,9 +1129,13 @@ with tab_assume:
 with tab_src:
     st.dataframe(sources, hide_index=True, width="stretch",
                  column_config={"Source": st.column_config.LinkColumn("Source")})
-    for r in data.values():
+    for k, r in data.items():
+        note = ""
+        if k == "yields" and r.status != "live" and yields_live:
+            note = (" - the all-country table is behind a bot check, so the U.S. and selected-country yields "
+                    "above were fetched live from their individual Trading Economics pages")
         st.caption(f"**{r.name}** - status: {r.status}; fetched {r.fetched_at}; as of {r.as_of}"
-                   + (f"; live error: {r.error}" if r.error else ""))
+                   + (f"; live error: {r.error}" if r.error else "") + note)
     st.markdown("OECD rates are pulled from the OECD Data Explorer API (dataset `DSD_TAX_CIT@DF_CIT`), which is the "
                 "data behind the *Statutory corporate income tax rates* chapter of Corporate Tax Statistics.")
     with st.expander("All countries: yields and tax rates"):
