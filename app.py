@@ -192,7 +192,10 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://tradingeconomics.com/",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # Trading Economics name -> OECD name, where they differ
@@ -292,10 +295,11 @@ def parse_ratings_html(html: str) -> tuple[float, str]:
     cell in document order belongs to it; the spread is the next cell.
     """
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"Date of Analysis:\s*(.+?)(?:\s{2,}|If you want|$)", text)
-    as_of = m.group(1).strip() if m else "unknown"
-    as_of = re.sub(r"^Data used is as of\s*", "", as_of)
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True).replace("\xa0", " "))
+    m = re.search(r"as of\s+([A-Z][a-z]+\.?\s+\d{4})", text) or re.search(
+        r"Date\s*of\s*Analysis\s*:?\s*(?:Data used is as of\s*)?([A-Za-z]+\.?\s+\d{4})", text, re.I
+    )
+    as_of = m.group(1).strip() if m else "date not shown on page"
 
     for tr in soup.find_all("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
@@ -340,33 +344,69 @@ def _te_date(label: str, today: date) -> str:
     return d.isoformat()
 
 
+TE_NAME_ALIASES = {"US": "United States", "U.S.": "United States", "UK": "United Kingdom",
+                   "Korea": "South Korea", "Czechia": "Czech Republic"}
+_TE_DATE = re.compile(r"^[A-Z][a-z]{2}/\d{1,2}$")
+
+
+def _te_clean_name(name: str) -> str:
+    name = re.sub(r"\s+10Y$", "", name.strip())
+    return TE_NAME_ALIASES.get(name, name)
+
+
+def _num(text: str) -> float | None:
+    try:
+        return float(text.strip().replace(",", "").replace("%", ""))
+    except ValueError:
+        return None
+
+
 def parse_te_bonds_html(html: str, today: date | None = None) -> pd.DataFrame:
-    """Parse the 10-year yield tables on tradingeconomics.com/bonds."""
+    """Parse the 10-year yield tables on tradingeconomics.com/bonds.
+
+    Strategy 1: rows tagged data-symbol with td#p (yield) and td#date (normal page layout).
+    Strategy 2: any table row containing a link to /<country>/government-bond-yield; the yield is the
+    first numeric cell after the country cell and the date is the cell that looks like 'Nov/13'.
+    """
     today = today or datetime.now(timezone.utc).date()
     soup = BeautifulSoup(html, "html.parser")
     rows = []
+
     for tr in soup.select("tr[data-symbol]"):
         name_td = tr.select_one("td.datatable-item-first")
         yld_td = tr.find("td", id="p")
         date_td = tr.find("td", id="date")
-        if not (name_td and yld_td):
+        y = _num(yld_td.get_text(strip=True)) if yld_td else None
+        if name_td is None or y is None:
             continue
-        name = name_td.get_text(" ", strip=True)
-        try:
-            y = float(yld_td.get_text(strip=True).replace(",", ""))
-        except ValueError:
-            continue
-        rows.append(
-            {
-                "country": name,
-                "yield": y / 100,
-                "date": _te_date(date_td.get_text(strip=True), today) if date_td else "",
-                "symbol": tr.get("data-symbol", ""),
-            }
-        )
+        rows.append({"country": _te_clean_name(name_td.get_text(" ", strip=True)), "yield": y / 100,
+                     "date": _te_date(date_td.get_text(strip=True), today) if date_td else ""})
+
+    if not rows:  # strategy 2
+        for tr in soup.find_all("tr"):
+            link = tr.find("a", href=re.compile(r"/government-bond-yield/?$"))
+            if link is None:
+                continue
+            cells = tr.find_all("td")
+            texts = [c.get_text(" ", strip=True) for c in cells]
+            try:
+                i = next(k for k, c in enumerate(cells) if link in c.find_all("a"))
+            except StopIteration:
+                continue
+            y = next((v for v in (_num(t) for t in texts[i + 1:]) if v is not None), None)
+            if y is None:
+                continue
+            d = next((t for t in texts if _TE_DATE.match(t)), "")
+            rows.append({"country": _te_clean_name(link.get_text(" ", strip=True)), "yield": y / 100,
+                         "date": _te_date(d, today) if d else ""})
+
     df = pd.DataFrame(rows)
     if df.empty or "United States" not in set(df["country"]):
-        raise ValueError("United States 10Y yield not found on Trading Economics page")
+        title = soup.title.get_text(strip=True)[:80] if soup.title else "no title"
+        raise ValueError(
+            f"United States 10Y yield not found on Trading Economics page "
+            f"(page title: '{title}', {len(html):,} characters, {len(rows)} rows parsed)"
+        )
     df = df[df["country"] != "Euro area"].drop_duplicates("country")
     return df.sort_values("country").reset_index(drop=True)
 
